@@ -117,6 +117,14 @@ impl LoroDoc {
         LoroDoc::_new(doc)
     }
 
+    /// Create a new `LoroDoc` instance with provided external kv store.
+    #[inline]
+    pub fn new_external<T: KvStore + 'static>(external_kv: T) -> Self {
+        let doc = InnerLoroDoc::new_external(external_kv);
+        doc.start_auto_commit();
+
+        LoroDoc::_new(doc)
+    }
     /// Duplicate the document with a different PeerID
     ///
     /// The time complexity and space complexity of this operation are both O(n),
