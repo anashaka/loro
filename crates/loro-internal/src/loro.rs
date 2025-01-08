@@ -41,6 +41,7 @@ use crate::{
     event::{str_to_path, EventTriggerKind, Index, InternalDocDiff},
     handler::{Handler, MovableListHandler, TextHandler, TreeHandler, ValueOrHandler},
     id::PeerID,
+    kv_store::KvStore,
     op::InnerContent,
     oplog::{loro_dag::FrontiersNotIncluded, OpLog},
     state::DocState,
@@ -96,6 +97,27 @@ impl LoroDoc {
         }
     }
 
+    pub fn new_external<T: KvStore + 'static>(external_kv: T) -> Self {
+        let oplog = OpLog::new_external(external_kv);
+        let arena = oplog.arena.clone();
+        let global_txn = Arc::new(Mutex::new(None));
+        let config: Configure = oplog.configure.clone();
+        // share arena
+        let state = DocState::new_arc(arena.clone(), Arc::downgrade(&global_txn), config.clone());
+        Self {
+            oplog: Arc::new(Mutex::new(oplog)),
+            state,
+            config,
+            detached: AtomicBool::new(false),
+            auto_commit: AtomicBool::new(false),
+            observer: Arc::new(Observer::new(arena.clone())),
+            diff_calculator: Arc::new(Mutex::new(DiffCalculator::new(true))),
+            txn: global_txn,
+            arena,
+            local_update_subs: SubscriberSetWithQueue::new(),
+            peer_id_change_subs: SubscriberSetWithQueue::new(),
+        }
+    }
     pub fn fork(&self) -> Self {
         if self.is_detached() {
             return self.fork_at(&self.state_frontiers());

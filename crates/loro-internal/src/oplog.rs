@@ -22,6 +22,7 @@ use crate::encoding::{decode_oplog, encode_oplog, EncodeMode};
 use crate::encoding::{ImportStatus, ParsedHeaderAndBody};
 use crate::history_cache::ContainerHistoryCache;
 use crate::id::{Counter, PeerID, ID};
+use crate::kv_store::KvStore;
 use crate::op::{FutureInnerContent, ListSlice, RawOpContent, RemoteOp, RichOp};
 use crate::span::{HasCounterSpan, HasLamportSpan};
 use crate::version::{Frontiers, ImVersionVector, VersionVector};
@@ -71,6 +72,23 @@ impl OpLog {
         let arena = SharedArena::new();
         let cfg = Configure::default();
         let change_store = ChangeStore::new_mem(&arena, cfg.merge_interval.clone());
+        Self {
+            history_cache: Mutex::new(ContainerHistoryCache::new(change_store.clone(), None)),
+            dag: AppDag::new(change_store.clone()),
+            change_store,
+            arena,
+            pending_changes: Default::default(),
+            batch_importing: false,
+            configure: cfg,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn new_external<T: KvStore + 'static>(external_kv: T) -> Self {
+        let arena = SharedArena::new();
+        let cfg = Configure::default();
+        let change_store =
+            ChangeStore::new_external(&arena, cfg.merge_interval.clone(), external_kv);
         Self {
             history_cache: Mutex::new(ContainerHistoryCache::new(change_store.clone(), None)),
             dag: AppDag::new(change_store.clone()),

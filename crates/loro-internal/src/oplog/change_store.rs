@@ -126,7 +126,24 @@ impl ChangeStore {
             merge_interval,
         }
     }
-
+    pub fn new_external<T: KvStore + 'static>(
+        a: &SharedArena,
+        merge_interval: Arc<AtomicI64>,
+        external_kv: T,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ChangeStoreInner {
+                start_vv: ImVersionVector::new(),
+                start_frontiers: Frontiers::default(),
+                mem_parsed_kv: BTreeMap::new(),
+            })),
+            arena: a.clone(),
+            external_vv: Arc::new(Mutex::new(VersionVector::new())),
+            external_kv: Arc::new(Mutex::new(external_kv)),
+            // external_kv: Arc::new(Mutex::new(BTreeMap::default())),
+            merge_interval,
+        }
+    }
     #[cfg(test)]
     fn new_for_test() -> Self {
         Self::new_mem(&SharedArena::new(), Arc::new(AtomicI64::new(0)))
