@@ -1,6 +1,5 @@
 use either::Either;
 use fxhash::{FxHashMap, FxHashSet};
-use itertools::Itertools;
 use loro_common::{
     ContainerID, ContainerType, HasIdSpan, HasLamportSpan, IdSpan, LoroEncodeError, LoroResult,
     LoroValue, ID,
@@ -154,7 +153,7 @@ impl LoroDoc {
         self.config.set_record_timestamp(record);
     }
 
-    /// Set the interval of mergeable changes, in milliseconds.
+    /// Set the interval of mergeable changes, in seconds.
     ///
     /// If two continuous local changes are within the interval, they will be merged into one change.
     /// The default value is 1000 seconds.
@@ -856,7 +855,7 @@ impl LoroDoc {
         // Try applying the diff, but ignore the error if it happens.
         // MovableList's undo behavior is too tricky to handle in a collaborative env
         // so in edge cases this may be an Error
-        if let Err(e) = self.apply_diff(diff, container_remap, true) {
+        if let Err(e) = self._apply_diff(diff, container_remap, true) {
             warn!("Undo Failed {:?}", e);
         }
 
@@ -866,11 +865,17 @@ impl LoroDoc {
         })
     }
 
-    /// Calculate the diff between the current state and the target state, and apply the diff to the current state.
-    pub fn diff_and_apply(&self, target: &Frontiers) -> LoroResult<()> {
+    /// Generate a series of local operations that can revert the current doc to the target
+    /// version.
+    ///
+    /// Internally, it will calculate the diff between the current state and the target state,
+    /// and apply the diff to the current state.
+    pub fn revert_to(&self, target: &Frontiers) -> LoroResult<()> {
+        // TODO: test when the doc is readonly
+        // TODO: test when the doc is detached but enabled editing
         let f = self.state_frontiers();
         let diff = self.diff(&f, target)?;
-        self.apply_diff(diff, &mut Default::default(), false)
+        self._apply_diff(diff, &mut Default::default(), false)
     }
 
     /// Calculate the diff between two versions so that apply diff on a will make the state same as b.
@@ -894,26 +899,31 @@ impl LoroDoc {
         }
 
         self.commit_then_stop();
-
-        let ans = {
-            let was_detached = self.is_detached();
-            let old_frontiers = self.state_frontiers();
-            self.state.try_lock().unwrap().stop_and_clear_recording();
-            self.checkout_without_emitting(a, true).unwrap();
-            self.state.try_lock().unwrap().start_recording();
-            self.checkout_without_emitting(b, true).unwrap();
+        let was_detached = self.is_detached();
+        let old_frontiers = self.state_frontiers();
+        self.state.try_lock().unwrap().stop_and_clear_recording();
+        self.checkout_without_emitting(a, true).unwrap();
+        self.state.try_lock().unwrap().start_recording();
+        self.checkout_without_emitting(b, true).unwrap();
+        let e = {
             let mut state = self.state.try_lock().unwrap();
             let e = state.take_events();
             state.stop_and_clear_recording();
-            self.checkout_without_emitting(&old_frontiers, false)
-                .unwrap();
-            if !was_detached {
-                self.set_detached(false);
-            }
-            DiffBatch::new(e)
+            e
         };
+        self.checkout_without_emitting(&old_frontiers, false)
+            .unwrap();
+        if !was_detached {
+            self.set_detached(false);
+            self.renew_txn_if_auto_commit();
+        }
+        Ok(DiffBatch::new(e))
+    }
 
-        Ok(ans)
+    /// Apply a diff to the current state.
+    #[inline(always)]
+    pub fn apply_diff(&self, diff: DiffBatch) -> LoroResult<()> {
+        self._apply_diff(diff, &mut Default::default(), true)
     }
 
     /// Apply a diff to the current state.
@@ -927,9 +937,9 @@ impl LoroDoc {
     ///
     /// However, the diff may contain operations that depend on container IDs.
     /// Therefore, users need to provide a `container_remap` to record and retrieve the container ID remapping.
-    pub fn apply_diff(
+    pub(crate) fn _apply_diff(
         &self,
-        mut diff: DiffBatch,
+        diff: DiffBatch,
         container_remap: &mut FxHashMap<ContainerID, ContainerID>,
         skip_unreachable: bool,
     ) -> LoroResult<()> {
@@ -937,20 +947,18 @@ impl LoroDoc {
             return Err(LoroError::EditWhenDetached);
         }
 
-        // Sort container from the top to the bottom, so that we can have correct container remap
-        let containers = diff.0.keys().cloned().sorted_by_cached_key(|cid| {
-            let idx = self.arena.id_to_idx(cid).unwrap();
-            self.arena.get_depth(idx).unwrap().get()
-        });
-
         let mut ans: LoroResult<()> = Ok(());
-        for mut id in containers {
+        let mut missing_containers: Vec<ContainerID> = Vec::new();
+        for (mut id, diff) in diff.into_iter() {
             let mut remapped = false;
-            let diff = diff.0.remove(&id).unwrap();
-
             while let Some(rid) = container_remap.get(&id) {
                 remapped = true;
                 id = rid.clone();
+            }
+
+            if matches!(&id, ContainerID::Normal { .. }) && self.arena.id_to_idx(&id).is_none() {
+                missing_containers.push(id);
+                continue;
             }
 
             if skip_unreachable && !remapped && !self.state.try_lock().unwrap().get_reachable(&id) {
@@ -961,6 +969,12 @@ impl LoroDoc {
             if let Err(e) = h.apply_diff(diff, container_remap) {
                 ans = Err(e);
             }
+        }
+
+        if !missing_containers.is_empty() {
+            return Err(LoroError::ContainersNotFound {
+                containers: Box::new(missing_containers),
+            });
         }
 
         ans
@@ -1791,15 +1805,27 @@ impl Drop for CommitWhenDrop<'_> {
     }
 }
 
+/// Options for configuring a commit operation.
 #[derive(Debug, Clone)]
 pub struct CommitOptions {
+    /// Origin identifier for the commit event, used to track the source of changes.
+    /// It doesn't persist.
     pub origin: Option<InternalString>,
+
+    /// Whether to immediately start a new transaction after committing.
+    /// Defaults to true.
     pub immediate_renew: bool,
+
+    /// Custom timestamp for the commit in seconds since Unix epoch.
+    /// If None, the current time will be used.
     pub timestamp: Option<Timestamp>,
+
+    /// Optional commit message to attach to the changes. It will be persisted.
     pub commit_msg: Option<Arc<str>>,
 }
 
 impl CommitOptions {
+    /// Creates a new CommitOptions with default values.
     pub fn new() -> Self {
         Self {
             origin: None,
@@ -1809,30 +1835,38 @@ impl CommitOptions {
         }
     }
 
+    /// Sets the origin identifier for this commit.
     pub fn origin(mut self, origin: &str) -> Self {
         self.origin = Some(origin.into());
         self
     }
 
+    /// Sets whether to immediately start a new transaction after committing.
     pub fn immediate_renew(mut self, immediate_renew: bool) -> Self {
         self.immediate_renew = immediate_renew;
         self
     }
 
+    /// Set the timestamp of the commit.
+    ///
+    /// The timestamp is the number of **seconds** that have elapsed since 00:00:00 UTC on January 1, 1970.
     pub fn timestamp(mut self, timestamp: Timestamp) -> Self {
         self.timestamp = Some(timestamp);
         self
     }
 
+    /// Sets a commit message to be attached to the changes.
     pub fn commit_msg(mut self, commit_msg: &str) -> Self {
         self.commit_msg = Some(commit_msg.into());
         self
     }
 
+    /// Sets the origin identifier for this commit.
     pub fn set_origin(&mut self, origin: Option<&str>) {
         self.origin = origin.map(|x| x.into())
     }
 
+    /// Sets the timestamp for this commit.
     pub fn set_timestamp(&mut self, timestamp: Option<Timestamp>) {
         self.timestamp = timestamp;
     }

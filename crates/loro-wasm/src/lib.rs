@@ -5,7 +5,8 @@
 // #![warn(missing_docs)]
 
 use convert::{
-    import_status_to_js_value, js_to_id_span, js_to_version_vector, resolved_diff_to_js,
+    import_status_to_js_value, js_diff_to_inner_diff, js_to_id_span, js_to_version_vector,
+    resolved_diff_to_js,
 };
 use js_sys::{Array, Object, Promise, Reflect, Uint8Array};
 use loro_internal::{
@@ -23,7 +24,7 @@ use loro_internal::{
     json::JsonSchema,
     loro::{CommitOptions, ExportMode},
     loro_common::{check_root_container_name, IdSpanVector},
-    undo::{UndoItemMeta, UndoOrRedo},
+    undo::{DiffBatch, UndoItemMeta, UndoOrRedo},
     version::Frontiers,
     ContainerType, DiffEvent, FxHashMap, HandlerTrait, IdSpan, LoroDoc as LoroDocInner, LoroResult,
     LoroValue, MovableListHandler, Subscription, TreeNodeWithChildren, TreeParentId,
@@ -212,6 +213,8 @@ extern "C" {
     pub type JsIdSpan;
     #[wasm_bindgen(typescript_type = "VersionVectorDiff")]
     pub type JsVersionVectorDiff;
+    #[wasm_bindgen(typescript_type = "Record<ContainerID, Diff>")]
+    pub type JsDiffBatch;
 }
 
 mod observer {
@@ -411,9 +414,12 @@ impl LoroDoc {
         self.0.set_record_timestamp(auto_record);
     }
 
-    /// If two continuous local changes are within the interval, they will be merged into one change.
+    /// If two continuous local changes are within (<=) the interval(**in seconds**), they will be merged into one change.
     ///
-    /// The default value is 1_000_000, the default unit is seconds.
+    /// The default value is 1_000 seconds.
+    ///
+    /// By default, we record timestamps in seconds for each change. So if the merge interval is 1, and changes A and B
+    /// have timestamps of 3 and 4 respectively, then they will be merged into one change
     #[wasm_bindgen(js_name = "setChangeMergeInterval")]
     pub fn set_change_merge_interval(&self, interval: f64) {
         self.0.set_change_merge_interval(interval as i64);
@@ -812,12 +818,14 @@ impl LoroDoc {
         Ok(())
     }
 
-    /// Commit the cumulative auto committed transaction.
+    /// Commit the cumulative auto-committed transaction.
     ///
     /// You can specify the `origin`, `timestamp`, and `message` of the commit.
     ///
     /// - The `origin` is used to mark the event
     /// - The `message` works like a git commit message, which will be recorded and synced to peers
+    /// - The `timestamp` is the number of seconds that have elapsed since 00:00:00 UTC on January 1, 1970.
+    ///   It defaults to `Date.now() / 1000` when timestamp recording is enabled
     ///
     /// The events will be emitted after a transaction is committed. A transaction is committed when:
     ///
@@ -1870,6 +1878,74 @@ impl LoroDoc {
                 v.into()
             })
             .collect())
+    }
+
+    /// Revert the document to the given frontiers.
+    ///
+    /// The doc will not become detached when using this method. Instead, it will generate a series
+    /// of operations to revert the document to the given version.
+    ///
+    /// @example
+    /// ```ts
+    /// const doc = new LoroDoc();
+    /// doc.setPeerId("1");
+    /// const text = doc.getText("text");
+    /// text.insert(0, "Hello");
+    /// doc.commit();
+    /// doc.revertTo([{ peer: "1", counter: 1 }]);
+    /// expect(doc.getText("text").toString()).toBe("He");
+    /// ```
+    #[wasm_bindgen(js_name = "revertTo")]
+    pub fn revert_to(&self, frontiers: Vec<JsID>) -> JsResult<()> {
+        let frontiers = ids_to_frontiers(frontiers)?;
+        self.0.revert_to(&frontiers)?;
+        Ok(())
+    }
+
+    /// Apply a diff batch to the document
+    #[wasm_bindgen(js_name = "applyDiff")]
+    pub fn apply_diff(&self, diff: JsDiffBatch) -> JsResult<()> {
+        let diff: JsValue = diff.into();
+        let obj: js_sys::Object = diff.into();
+        let mut diff = FxHashMap::default();
+        let mut order = Vec::default();
+        for entry in js_sys::Object::entries(&obj).iter() {
+            let entry = entry.unchecked_into::<js_sys::Array>();
+            let k = entry.get(0);
+            let v = entry.get(1);
+            let d = js_diff_to_inner_diff(v)?;
+            let cid: ContainerID = k
+                .as_string()
+                .ok_or("Expected string key")?
+                .as_str()
+                .try_into()
+                .map_err(|_| "Failed to convert key")?;
+            order.push(cid.clone());
+            diff.insert(cid, d);
+        }
+        self.0.apply_diff(DiffBatch {
+            cid_to_events: diff,
+            order,
+        })?;
+        Ok(())
+    }
+
+    /// Calculate the differences between two frontiers
+    ///
+    /// The entries in the returned object are sorted by causal order: the creation of a child container will be
+    /// presented before its use.
+    pub fn diff(&self, from: Vec<JsID>, to: Vec<JsID>) -> JsResult<JsDiffBatch> {
+        let from = ids_to_frontiers(from)?;
+        let to = ids_to_frontiers(to)?;
+        let diff = self.0.diff(&from, &to)?;
+        let obj = js_sys::Object::new();
+        for (id, d) in diff.iter() {
+            let id_str = id.to_string();
+            let v = resolved_diff_to_js(d, &self.0);
+            Reflect::set(&obj, &JsValue::from_str(&id_str), &v)?;
+        }
+        let v: JsValue = obj.into();
+        Ok(v.into())
     }
 }
 
@@ -4552,6 +4628,7 @@ impl UndoManager {
     }
 
     /// Set the merge interval (in ms).
+    ///
     /// If the interval is set to 0, the undo steps will not be merged.
     /// Otherwise, the undo steps will be merged if the interval between the two steps is less than the given interval.
     pub fn setMergeInterval(&mut self, interval: f64) {
