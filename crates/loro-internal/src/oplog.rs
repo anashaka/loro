@@ -89,9 +89,10 @@ impl OpLog {
         let cfg = Configure::default();
         let change_store =
             ChangeStore::new_external(&arena, cfg.merge_interval.clone(), external_kv);
+        let dag = AppDag::new(change_store.clone());
         Self {
             history_cache: Mutex::new(ContainerHistoryCache::new(change_store.clone(), None)),
-            dag: AppDag::new(change_store.clone()),
+            dag,
             change_store,
             arena,
             pending_changes: Default::default(),

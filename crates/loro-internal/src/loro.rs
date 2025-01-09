@@ -41,10 +41,7 @@ use crate::{
     event::{str_to_path, EventTriggerKind, Index, InternalDocDiff},
     handler::{Handler, MovableListHandler, TextHandler, TreeHandler, ValueOrHandler},
     id::PeerID,
-<<<<<<< HEAD
     json::JsonChange,
-=======
->>>>>>> a16fe367b52db81200db634e23f574baa970d7cc
     kv_store::KvStore,
     op::InnerContent,
     oplog::{loro_dag::FrontiersNotIncluded, OpLog},
